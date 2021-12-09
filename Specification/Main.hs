@@ -26,8 +26,12 @@ import qualified Ledger.Scripts as Scripts
 import qualified Ledger.Typed.Scripts as TScripts
 import qualified Ledger.Value as Value
 import qualified Plutus.Contract as Contract
+import qualified Plutus.Contract.Wallet as Wallet
 import qualified Plutus.Trace.Emulator as Trace
+import qualified Plutus.Contracts.Currency as Currency
 import qualified PlutusTx
+import qualified PlutusTx.AssocMap as AssocMap
+import PlutusTx.Prelude (traceIfFalse)
 import Plutus.Trace.Emulator
 import Wallet.Emulator (knownWallet)
 import Prelude
@@ -47,10 +51,8 @@ instance TScripts.ValidatorTypes CDP where
 
 {-# INLINEABLE mkValidator #-}
 mkValidator :: CDPDatum -> CDPAction -> Ledger.ScriptContext -> Bool
-mkValidator datum action _ = case action of
-    CDPInit -> case datum of
-        ManagerDatum ls -> length ls == 0
-        UserDatum _ _ _ -> False
+mkValidator datum action scriptcontext = case action of
+    CDPInit -> traceIfFalse "No input needed" ((length $ Ledger.txInfoInputs $ Ledger.scriptContextTxInfo scriptcontext) == 0)
     CDPOpen -> True
     CDPDeposit -> True
     CDPWithdraw -> True
@@ -72,7 +74,7 @@ cdpAddress :: Ledger.Address
 cdpAddress = Ledger.scriptAddress cdpValidator
 
 {-# INLINEABLE mkPolicy #-}
-mkPolicy :: () -> Ledger.ScriptContext -> Bool
+mkPolicy :: Ledger.TxOutRef -> Ledger.ScriptContext -> Bool
 mkPolicy _ _ = True
 
 mintingPolicy :: TScripts.MintingPolicy
@@ -102,8 +104,27 @@ rightToMaybe x = case x of
     Left a -> Nothing
     Right b -> Just b
 
-init :: Contract.Contract w s Contract.ContractError ()
-init = undefined
+mkCurrency :: Ledger.TxOutRef -> [(Value.TokenName, Integer)] -> Currency.OneShotCurrency
+mkCurrency (Ledger.TxOutRef h i) amts =
+    Currency.OneShotCurrency
+        { Currency.curRefTransactionOutput = (h, i)
+        , Currency.curAmounts              = AssocMap.fromList amts
+        }    
+
+init :: Contract.Contract w s Currency.CurrencyError Currency.OneShotCurrency
+init = do
+    ownPubKey <- Contract.ownPubKeyHash
+    txOutRef <- Wallet.getUnspentOutput
+    utxos <- Contract.utxosAt (Ledger.pubKeyHashAddress ownPubKey)
+    let theCurrency = mkCurrency txOutRef [("authToken", 1)]
+        curVali     = Currency.curPolicy theCurrency
+        lookups     = Constraints.mintingPolicy curVali
+                    <> Constraints.unspentOutputs utxos
+        tx          = Constraints.mustSpendPubKeyOutput txOutRef
+                    <> Constraints.mustMintValue (Currency.mintedValue theCurrency)
+                    <> Constraints.mustPayToTheScript (ManagerDatum []) (Currency.mintedValue theCurrency) 
+    void $ Contract.submitTxConstraintsWith lookups tx >>= Contract.awaitTxConfirmed . Ledger.getCardanoTxId
+    pure theCurrency        
 
 open :: Contract.Contract w s Contract.ContractError ()
 open = do
@@ -180,7 +201,7 @@ withdraw amount = do
         isCDPOutput myk o = case (fromJust $ getDatum @CDPDatum o) of
             ManagerDatum md -> False
             UserDatum cd _ _ -> cd == myk
-    
+
 mint :: Integer -> Contract.Contract w s Contract.ContractError ()
 mint amount = do
     myKey <- Contract.ownPubKeyHash
