@@ -166,7 +166,6 @@ open UserParams{..} = do
                             then
                                 Contract.throwError "Can't open CDP"
                             else do
-                                logInfo 
                                 let lookups = Constraints.typedValidatorLookups (cdpInstance $ ValidatorParams $ upnft)
                                     tx = Constraints.mustSpendScriptOutput oref (Scripts.Redeemer $ PlutusTx.toBuiltinData CDPOpen)
                                         <> Constraints.mustPayToTheScript (UserDatum myKey 0 0) (Ada.lovelaceValueOf 0)
