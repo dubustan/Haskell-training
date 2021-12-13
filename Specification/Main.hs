@@ -17,7 +17,6 @@
 {-# LANGUAGE ViewPatterns          #-}
 
 module Main where
-
 import Control.Monad (void)
 import Control.Lens
 import qualified Data.Map as M
@@ -37,6 +36,7 @@ import qualified Plutus.Contract.Wallet as Wallet
 import qualified Plutus.Trace.Emulator as Trace
 import qualified Plutus.Contracts.Currency as Currency
 import qualified PlutusTx
+import qualified PlutusTx.Eq as PEq
 import qualified PlutusTx.AssocMap as AssocMap
 import qualified PlutusTx.Trace as PTrace
 import PlutusTx.Prelude (traceIfFalse)
@@ -51,7 +51,7 @@ data CDPDatum = ManagerDatum {getList :: [Ledger.PubKeyHash]} | UserDatum {getPK
 data UserParams = UserParams {upnft :: Value.Value, upamount :: Integer} deriving (FromJSON, ToJSON, Monoid, Generic, Semigroup)
 data ValidatorParams = ValidatorParams {vpnft :: Value.Value}
 
-data CDPAction = CDPInit | CDPOpen | CDPDeposit | CDPWithdraw | CDPMint | CDPBurn
+data CDPAction = CDPOpen Ledger.PubKeyHash | CDPDeposit Integer | CDPWithdraw Integer | CDPMint Integer | CDPBurn Integer
 PlutusTx.unstableMakeIsData ''CDPAction
 PlutusTx.unstableMakeIsData ''ValidatorParams
 PlutusTx.unstableMakeIsData ''UserParams
@@ -66,21 +66,32 @@ instance TScripts.ValidatorTypes CDP where
 {-# INLINEABLE mkValidator #-}
 mkValidator :: ValidatorParams -> CDPDatum -> CDPAction -> Ledger.ScriptContext -> Bool
 mkValidator ValidatorParams{..} datum action ctx = case action of
-    CDPInit -> False
-    CDPOpen -> True
-    CDPDeposit -> case datum of
+    CDPOpen key -> case datum of
+        ManagerDatum ls -> 
+            PTrace.traceIfFalse "The input must contains nft" (vpnft == (Ledger.txOutValue managerInput)) &&
+            PTrace.traceIfFalse "The user key must not be in the input and must be in the output" (appended key) 
+    CDPDeposit amount -> case datum of
+        UserDatum{..} -> True
+        ManagerDatum _ -> False
+    CDPWithdraw amount -> case datum of
+        UserDatum{..} -> True
+        ManagerDatum _ -> False
+    CDPMint amount -> case datum of
         ManagerDatum _ -> False
         UserDatum{..} -> True
-    CDPWithdraw -> case datum of
+    CDPBurn amount -> case datum of
         ManagerDatum _ -> False
         UserDatum{..} -> True
-    CDPMint -> case datum of
-        ManagerDatum _ -> False
-        UserDatum{..} -> True
-    CDPBurn -> case datum of
-        ManagerDatum _ -> False
-        UserDatum{..} -> True
-    where 
+    where
+        ada :: Integer
+        ada = 13
+
+        iTSLA :: Integer
+        iTSLA = 7096
+
+        collateralRatio :: Integer
+        collateralRatio = 15
+
         info :: Ledger.TxInfo
         info = Ledger.scriptContextTxInfo ctx
 
@@ -89,37 +100,102 @@ mkValidator ValidatorParams{..} datum action ctx = case action of
 
         outputs :: [Ledger.TxOut]
         outputs = Ledger.txInfoOutputs info
-        
-        isZero :: [a] -> Bool
-        isZero x = case x of 
-            [] -> True
-            _ -> False
-        
-        isOne :: [a] -> Bool
-        isOne x = case x of
-            a:[] -> True
-            _ -> False
-        
-        isTwo :: [a] -> Bool
-        isTwo x = case x of
-            a:b:[] -> True
-            _ -> False
-            
-        isThree :: [a] -> Bool
-        isThree x = case x of
-            a:b:c:[] -> True
-            _ -> False
-            
-        head :: [a] -> a
-        head x = case x of
-            x:xs -> x
-            _ -> PTrace.traceError "Impossible case"
-        
-        mintValue :: Value.Value
-        mintValue = Ledger.txInfoMint info
 
-        isNFT :: Bool
-        isNFT = (vpnft == mintValue)
+        managerInput :: Ledger.TxOut
+        managerInput = 
+            let 
+                isManager :: Ledger.TxOut -> Bool
+                isManager txout = case findCDPDatum txout of
+                    ManagerDatum _ -> True
+                    _ -> False
+                cc = [i | i <- inputs, isManager $ Ledger.txInInfoResolved i]
+            in 
+                case cc of 
+                    [a] -> Ledger.txInInfoResolved a
+                    _ -> PTrace.traceError "expected exactly one manager input"
+
+        userInput :: Ledger.TxOut
+        userInput =
+            let
+                isUser :: Ledger.TxOut -> Bool
+                isUser txout = case findCDPDatum txout of
+                    ManagerDatum _ -> False
+                    _ -> True
+                cc = [i | i <- inputs, isUser $ Ledger.txInInfoResolved i]
+            in 
+                case cc of 
+                    [a] -> Ledger.txInInfoResolved a
+                    _ -> PTrace.traceError "expected exactly one user input"
+
+        managerOutput :: Ledger.TxOut
+        managerOutput =
+            let
+                isManager :: Ledger.TxOut -> Bool
+                isManager txout = case findCDPDatum txout of
+                    ManagerDatum _ -> True
+                    _ -> False
+                cc = [i | i <- outputs, isManager i]
+            in
+                case outputs of
+                    [a] -> a
+                    _ -> PTrace.traceError "expected exactly one manager output"
+        userOutput :: Ledger.TxOut
+        userOutput = 
+            let 
+                isUser :: Ledger.TxOut -> Bool
+                isUser txout = case findCDPDatum txout of
+                    ManagerDatum _ -> False
+                    _ -> True
+                cc = [i | i <- outputs, isUser i]
+            in 
+                case cc of 
+                    [a] -> a
+                    _ -> PTrace.traceError "expected exactly one user output"
+                    
+        elem :: PEq.Eq a => a -> [a] -> Bool
+        elem a cc = case cc of 
+            [] -> False
+            x:xs -> (a PEq.== x) || (elem a xs)
+        
+        findCDPDatum :: Ledger.TxOut -> CDPDatum
+        findCDPDatum txout =
+            case Ledger.txOutDatumHash txout of
+                Nothing -> PTrace.traceError "No Datum Hash"
+                Just cc -> 
+                    case cdpDatum txout (`Ledger.findDatum` info) of
+                        Just x -> x
+                        _ -> PTrace.traceError "No datum"
+            
+        appended :: Ledger.PubKeyHash -> Bool
+        appended key = 
+            let
+                newList :: [Ledger.PubKeyHash]
+                newList = case (findCDPDatum managerOutput) of
+                    ManagerDatum x -> x
+                    _ -> PTrace.traceError "no new list" 
+
+                oldList :: [Ledger.PubKeyHash]
+                oldList = case (findCDPDatum managerInput) of
+                    ManagerDatum x -> x
+                    _ -> PTrace.traceError "no old list"
+                    
+                inNewList :: Bool
+                inNewList = case (elem key newList) of
+                    True -> True
+                    False -> PTrace.traceError "The user pubkeyhash not in the new list"
+                    
+                ninOldList :: Bool
+                ninOldList = case (not $ elem key oldList) of
+                    True -> True
+                    False -> PTrace.traceError "The user pubkeyhash in the old list"
+            in 
+                inNewList && ninOldList 
+
+        cdpDatum :: Ledger.TxOut  -> (Scripts.DatumHash -> Maybe Scripts.Datum) -> Maybe CDPDatum
+        cdpDatum o f = do
+            dh <- Ledger.txOutDatum o
+            Scripts.Datum d <- f dh
+            PlutusTx.fromBuiltinData d
 
 cdpInstance :: ValidatorParams -> TScripts.TypedValidator CDP
 cdpInstance params = 
@@ -212,7 +288,7 @@ open UserParams{..} = do
                     let lookups = Constraints.typedValidatorLookups (cdpInstance $ ValidatorParams $ upnft)
                                 <> Constraints.otherScript(cdpValidator $ ValidatorParams $ upnft)
                                 <> Constraints.unspentOutputs (M.fromList [(oref, o)])
-                        tx = Constraints.mustSpendScriptOutput oref (Scripts.Redeemer $ PlutusTx.toBuiltinData CDPOpen)
+                        tx = Constraints.mustSpendScriptOutput oref (Scripts.Redeemer $ PlutusTx.toBuiltinData $ CDPOpen myKey)
                             <> Constraints.mustPayToTheScript (UserDatum myKey 0 0) (Ada.lovelaceValueOf 0)
                             <> Constraints.mustPayToTheScript (ManagerDatum $ myKey : cdpOpenedList) (getValue o) 
                     Contract.submitTxConstraintsWith lookups tx >>= Contract.awaitTxConfirmed . Ledger.getCardanoTxId
@@ -234,7 +310,7 @@ deposit UserParams{..} = do
                         userDatum = fromJust $ getDatum @CDPDatum o
                         lookups = Constraints.typedValidatorLookups (cdpInstance $ ValidatorParams $ upnft) 
                                 <> Constraints.unspentOutputs (M.fromList [(oref, o)])
-                        constraints = Constraints.mustSpendScriptOutput oref (Scripts.Redeemer (PlutusTx.toBuiltinData CDPDeposit)) 
+                        constraints = Constraints.mustSpendScriptOutput oref (Scripts.Redeemer (PlutusTx.toBuiltinData $ CDPDeposit upamount)) 
                                     <> Constraints.mustPayToTheScript (UserDatum myKey ((getADA userDatum) + upamount) (getMinted userDatum)) (getValue o <> Ada.lovelaceValueOf upamount)
                     Contract.submitTxConstraintsWith lookups constraints >>= Contract.awaitTxConfirmed . Ledger.getCardanoTxId
     where
@@ -264,7 +340,7 @@ withdraw UserParams{..} = do
                                     let lookups = Constraints.typedValidatorLookups (cdpInstance $ ValidatorParams $ upnft)
                                                 <> Constraints.otherScript(cdpValidator $ ValidatorParams $ upnft)
                                                 <> Constraints.unspentOutputs (M.fromList [(oref, o)])
-                                        constraints = Constraints.mustSpendScriptOutput oref (Scripts.Redeemer (PlutusTx.toBuiltinData CDPWithdraw)) 
+                                        constraints = Constraints.mustSpendScriptOutput oref (Scripts.Redeemer (PlutusTx.toBuiltinData $ CDPWithdraw upamount)) 
                                                     <> Constraints.mustPayToTheScript (UserDatum myKey ((getADA userDatum) - upamount) (getMinted userDatum)) (getValue o <> Ada.lovelaceValueOf (-upamount))
                                     Contract.submitTxConstraintsWith lookups constraints >>= Contract.awaitTxConfirmed . Ledger.getCardanoTxId
     where
@@ -293,7 +369,7 @@ mint UserParams{..} = do
                                         <> Constraints.unspentOutputs (M.fromList [(oref, o)])
                                         <> Constraints.mintingPolicy mintingPolicy
                                         <> Constraints.otherScript(cdpValidator $ ValidatorParams $ upnft)
-                                constraints = Constraints.mustSpendScriptOutput oref (Scripts.Redeemer (PlutusTx.toBuiltinData CDPMint))
+                                constraints = Constraints.mustSpendScriptOutput oref (Scripts.Redeemer (PlutusTx.toBuiltinData $ CDPMint upamount))
                                             <> Constraints.mustMintValue val
                                             <> Constraints.mustPayToTheScript (UserDatum myKey (getADA userDatum) ((getMinted userDatum) + upamount)) (getValue o)
                             Contract.submitTxConstraintsWith lookups constraints >>= Contract.awaitTxConfirmed . Ledger.getCardanoTxId
@@ -323,7 +399,7 @@ burn UserParams{..} = do
                                         <> Constraints.unspentOutputs (M.fromList [(oref, o)])
                                         <> Constraints.mintingPolicy mintingPolicy
                                         <> Constraints.otherScript(cdpValidator $ ValidatorParams $ upnft)
-                                constraints = Constraints.mustSpendScriptOutput oref (Scripts.Redeemer (PlutusTx.toBuiltinData CDPMint))
+                                constraints = Constraints.mustSpendScriptOutput oref (Scripts.Redeemer (PlutusTx.toBuiltinData $ CDPMint upamount))
                                              <> Constraints.mustMintValue val
                                             <> Constraints.mustPayToTheScript (UserDatum myKey (getADA userDatum) ((getMinted userDatum) - upamount)) (getValue o)
                             Contract.submitTxConstraintsWith lookups constraints >>= Contract.awaitTxConfirmed . Ledger.getCardanoTxId
@@ -368,10 +444,6 @@ main = Trace.runEmulatorTraceIO $ do
   Trace.callEndpoint @"Open" v2 $ UserParams p 0
   void $ Trace.waitNSlots 1
   return ()
-  
-  Trace.callEndpoint @"Deposit" v2 $ UserParams p 1000000
-  void $ Trace.waitNSlots 1
-
 
   where
     getCDPParam :: Trace.ContractHandle (Last Value.Value) InitSchema Contract.ContractError -> Trace.EmulatorTrace Value.Value 
